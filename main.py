@@ -61,7 +61,7 @@ def create_db_and_tables():
 # FastAPI app
 # ==============================
 
-app = FastAPI(title="Mobile Inventory Backend")
+app = FastAPI(title="Mobile Inventory Codesins")
 
 # CORS for Flutter (Android, emulator, web, etc.)
 app.add_middleware(
