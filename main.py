@@ -1,57 +1,25 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Field, create_engine, Session, select
+from sqlmodel import SQLModel, Field, Session, create_engine, select
 from typing import Optional, List
 from datetime import datetime
-import smtplib
-from email.mime.text import MIMEText
 
-# ===== DATABASE SETUP =====
+# ==============================
+# Database setup
+# ==============================
+
 DATABASE_URL = "sqlite:///./inventory.db"
 engine = create_engine(DATABASE_URL, echo=False)
 
 
-# ===== EMAIL (SMTP) CONFIG =====
-# Use Gmail with App Password OR any SMTP server.
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "codesinisters@gmail.com"           # TODO: change
-SMTP_PASSWORD = "ufbputduxwxhypao"    # TODO: change (App password)
-ALERT_RECEIVER = "codesinisters@gmail.com"     # TODO: change (teacher/your mail)
-LOW_STOCK_THRESHOLD = 3  # When quantity <= this, send mail
-
-
-def send_low_stock_email(item_name: str, qr_value: str, quantity: int):
-    subject = f"[Inventory Alert] Low stock for {item_name}"
-    body = (
-        f"Item: {item_name}\n"
-        f"QR: {qr_value}\n"
-        f"Current quantity: {quantity}\n\n"
-        "Please restock this item as soon as possible."
-    )
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = ALERT_RECEIVER
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        print(f"[EMAIL] Low stock email sent for {item_name}")
-    except Exception as e:
-        print("[EMAIL ERROR]", e)
-
-
-# ===== MODELS =====
 class ItemBase(SQLModel):
     name: str
     category: Optional[str] = None
     quantity: int = 0
     location: Optional[str] = None
     qr_value: str
+    unit_price: Optional[float] = None
+    image_url: Optional[str] = None
 
 
 class Item(ItemBase, table=True):
@@ -61,17 +29,22 @@ class Item(ItemBase, table=True):
 
 
 class ItemCreate(ItemBase):
+    """Schema for creating a new item"""
     pass
 
 
 class ItemUpdate(SQLModel):
+    """Schema for partial updates"""
     name: Optional[str] = None
     category: Optional[str] = None
     quantity: Optional[int] = None
     location: Optional[str] = None
+    unit_price: Optional[float] = None
+    image_url: Optional[str] = None
 
 
-class ItemResponse(ItemBase):
+class ItemRead(ItemBase):
+    """Schema used in responses"""
     id: int
     created_at: datetime
     updated_at: datetime
@@ -80,23 +53,20 @@ class ItemResponse(ItemBase):
         from_attributes = True
 
 
-class EspEvent(SQLModel):
-    qr_value: str
-    delta: int  # +1 or -1
-
-
-# ===== DB INIT =====
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 
-# ===== APP SETUP =====
-app = FastAPI(title="Smart Inventory Backend")
+# ==============================
+# FastAPI app
+# ==============================
 
-# CORS for Flutter app / others
+app = FastAPI(title="Mobile Inventory Backend")
+
+# CORS for Flutter (Android, emulator, web, etc.)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for dev; restrict in production
+    allow_origins=["*"],  # for hackathon it's fine; tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -108,28 +78,34 @@ def on_startup():
     create_db_and_tables()
 
 
-# ===== ROUTES =====
+# ==============================
+# Routes
+# ==============================
+
 @app.get("/")
 def root():
-    return {"message": "Smart Inventory Backend running"}
+    return {"message": "Mobile Inventory Backend running"}
 
 
-@app.get("/items", response_model=List[ItemResponse])
+@app.get("/items", response_model=List[ItemRead])
 def list_items():
     with Session(engine) as session:
         items = session.exec(select(Item)).all()
         return items
 
 
-@app.post("/items", response_model=ItemResponse)
+@app.post("/items", response_model=ItemRead)
 def create_item(item: ItemCreate):
     with Session(engine) as session:
-        # Ensure unique qr_value
+        # qr_value must be unique
         existing = session.exec(
             select(Item).where(Item.qr_value == item.qr_value)
         ).first()
         if existing:
-            raise HTTPException(status_code=400, detail="qr_value already exists")
+            raise HTTPException(
+                status_code=400,
+                detail="qr_value already exists. Use another QR / SKU.",
+            )
 
         db_item = Item(**item.dict())
         session.add(db_item)
@@ -138,7 +114,7 @@ def create_item(item: ItemCreate):
         return db_item
 
 
-@app.get("/items/{item_id}", response_model=ItemResponse)
+@app.get("/items/{item_id}", response_model=ItemRead)
 def get_item(item_id: int):
     with Session(engine) as session:
         item = session.get(Item, item_id)
@@ -147,66 +123,47 @@ def get_item(item_id: int):
         return item
 
 
-@app.get("/items/by-qr/{qr_value}", response_model=ItemResponse)
+@app.get("/items/by-qr/{qr_value}", response_model=ItemRead)
 def get_item_by_qr(qr_value: str):
+    """
+    Used by Flutter QR scanner.
+    QR content = qr_value (e.g. 'LAP-001')
+    """
     with Session(engine) as session:
         statement = select(Item).where(Item.qr_value == qr_value)
         item = session.exec(statement).first()
         if not item:
-            raise HTTPException(status_code=404, detail="Item not found for this QR")
+            raise HTTPException(
+                status_code=404,
+                detail="Item not found for this QR",
+            )
         return item
 
 
-@app.patch("/items/{item_id}", response_model=ItemResponse)
-def update_item(
-    item_id: int, data: ItemUpdate, background_tasks: BackgroundTasks
-):
+@app.patch("/items/{item_id}", response_model=ItemRead)
+def update_item(item_id: int, data: ItemUpdate):
     with Session(engine) as session:
         item = session.get(Item, item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Item not found")
 
-        for key, value in data.dict(exclude_unset=True).items():
+        update_data = data.dict(exclude_unset=True)
+        for key, value in update_data.items():
             setattr(item, key, value)
 
         item.updated_at = datetime.utcnow()
         session.add(item)
         session.commit()
         session.refresh(item)
-
-        # Email alert if low stock after manual update
-        if item.quantity <= LOW_STOCK_THRESHOLD:
-            background_tasks.add_task(
-                send_low_stock_email, item.name, item.qr_value, item.quantity
-            )
-
         return item
 
 
-@app.post("/esp/event", response_model=ItemResponse)
-def handle_esp_event(event: EspEvent, background_tasks: BackgroundTasks):
-    """
-    Called by ESP32 when an item is taken/added.
-    event.delta: +1 (added) or -1 (removed)
-    """
+@app.delete("/items/{item_id}", response_model=dict)
+def delete_item(item_id: int):
     with Session(engine) as session:
-        statement = select(Item).where(Item.qr_value == event.qr_value)
-        item = session.exec(statement).first()
+        item = session.get(Item, item_id)
         if not item:
-            raise HTTPException(status_code=404, detail="Item not found for this QR")
-
-        new_qty = item.quantity + event.delta
-        if new_qty < 0:
-            new_qty = 0
-        item.quantity = new_qty
-        item.updated_at = datetime.utcnow()
-        session.add(item)
+            raise HTTPException(status_code=404, detail="Item not found")
+        session.delete(item)
         session.commit()
-        session.refresh(item)
-
-        if item.quantity <= LOW_STOCK_THRESHOLD:
-            background_tasks.add_task(
-                send_low_stock_email, item.name, item.qr_value, item.quantity
-            )
-
-        return item
+        return {"detail": "Item deleted"}
